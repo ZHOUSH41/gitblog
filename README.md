@@ -5,4 +5,8 @@ My personal blog([About Me](https://github.com/yihong0618/gitblog/issues/282)) u
 [RSS Feed](https://raw.githubusercontent.com/ZHOUSH41/gitblog/master/feed.xml)
 
 ## 最近更新
+- [About Me](https://github.com/ZHOUSH41/gitblog/issues/2)--2025-10-22
 - [init blog](https://github.com/ZHOUSH41/gitblog/issues/1)--2025-10-22
+## TODO
+TODO list from [init blog](https://github.com/ZHOUSH41/gitblog/issues/1) all done
+
