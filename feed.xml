@@ -1,4 +1,204 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<feed xmlns="http://www.w3.org/2005/Atom"><id>https://github.com/ZHOUSH41/gitblog</id><title>RSS feed of ZHOUSH41's gitblog</title><updated>2025-10-22T08:50:12.892101+00:00</updated><link href="https://github.com/ZHOUSH41/gitblog"/><link href="https://raw.githubusercontent.com/ZHOUSH41/gitblog/master/feed.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><entry><id>https://github.com/ZHOUSH41/gitblog/issues/2</id><title>About Me</title><updated>2025-10-22T08:50:13.460218+00:00</updated><content type="html"><![CDATA[<p>关于我的自我介绍</p>
-]]></content><link href="https://github.com/ZHOUSH41/gitblog/issues/2"/><category term="About"/><published>2025-10-22T08:47:22+00:00</published></entry><entry><id>https://github.com/ZHOUSH41/gitblog/issues/1</id><title>init blog</title><updated>2025-10-22T08:50:13.736732+00:00</updated><content type="html"><![CDATA[<p>Test blog readme generate</p>
+<feed xmlns="http://www.w3.org/2005/Atom"><id>https://github.com/ZHOUSH41/gitblog</id><title>RSS feed of ZHOUSH41's gitblog</title><updated>2025-10-25T05:35:57.625945+00:00</updated><link href="https://github.com/ZHOUSH41/gitblog"/><link href="https://raw.githubusercontent.com/ZHOUSH41/gitblog/master/feed.xml" rel="self"/><generator uri="https://lkiesow.github.io/python-feedgen" version="1.0.0">python-feedgen</generator><entry><id>https://github.com/ZHOUSH41/gitblog/issues/3</id><title>从Yaml到Pod创建过程详解</title><updated>2025-10-25T05:35:58.003599+00:00</updated><content type="html"><![CDATA[<blockquote>
+<p>这篇文章将会完整的叙述出以下内容：<code>从用户提交 yaml 文件到集群Pod 实际创建的过程</code>，剖析 K8s 核心机制，有助于读者理清 K8s 内部组件之间的交互逻辑</p>
+</blockquote>
+<p>为了拆解从 Yaml 到 Pod 创建这个复杂的过程，文章分为三个章节来介绍：</p>
+<ol>
+<li>控制面： <code>API Server</code> 、<code>etcd </code>、<code>Admission Controller</code> 是如何协同工作的 </li>
+<li>调度与执行： 介绍 <code>Scheduler</code> 如何选择 node ，以及 <code>Kubelet</code> 和 <code>Container Runtime</code>  如何在 node 上拉起 Pod</li>
+<li>外挂系统：核心介绍 <code>Device Plugin</code> 是如何介入 Pod 创建流程</li>
+</ol>
+<h1>控制面</h1>
+<p>当你通过 kubectl 输入 <code>kubectl -kubeconfig=... apply -f pod.yaml</code> 之后，</p>
+<ol>
+<li>API Sever 会收到创建 Pod 的请求。在收到创建 Pod请求之后，API server 首先会对请求进行鉴权，认证请求来源是谁，有没有权限创建 Pod。</li>
+<li>
+在完成鉴权之后会进入Admission Ctrl 阶段，Addmission Ctrl 会请求进行修改（mutation） 和验证（validate），值得注意的是 K8s 提供了 <code>dynamic admission contrl </code> 扩展机制，方便用户自定义Admission 阶段，该过程如下：<ul>
+<li>A. 运行内置的 mutation ：比如 DefaultNamespace 插件，如果提交的请求namespace 为空，就修改成 default</li>
+<li>B. 运行自定义的 mutation：API server 会查看集群里面注册的MutationWebhookConfiguration，把已经修改过的请求发给外部的Webhook服务，比如 Istio 就是在这里注入一个 sidecar</li>
+<li>C. 运行内置的 validate</li>
+<li>D. 运行自定义的validate：API server 会查看集群里面注册的ValidatingWebhookConfiguration，比如：自定义的validate不允许创建带某个 label，API server 就会拒绝这个请求</li>
+</ul>
+</li>
+<li>持久化，经过程上述过程后，会把最后的 Pod 对象写入 etcd，此时 Pod 状态为 Pending</li>
+</ol>
+<h1>调度与执行</h1>
+<p>我们要创建的Pod 对象已经存储 etcd 中，但系统还不知道哪个 node 来运行这个 Pod。此时需要调度器（scheduler）登场发挥作用了。</p>
+<h2>Scheduler</h2>
+<ul>
+<li><strong>它是谁？</strong> <code>Scheduler</code> (调度器) 中央调度员”。它通过informer 机制 watch <code>API Server</code></li>
+<li>
+<strong>它做什么？</strong><ol>
+<li><strong>发现新工作</strong>：它通过 <code>API Server</code> 发现 <code>etcd</code> 里出现了一个新的 Pod，这个 Pod 的 <code>spec.nodeName</code> 字段是空的</li>
+<li>
+<strong>“海选” (Filtering - 过滤)</strong>：<code>Scheduler</code> 会查看集群里所有的 Node。它会过滤掉不满足 Pod 要求的 Node。比如：<ul>
+<li>Pod 需要 2核 CPU，Node A 只剩 1核了（淘汰！）。</li>
+<li>Pod 需要 GPU，Node B 根本没有 GPU（淘汰！）。</li>
+<li>Pod 要求必须在“华东区”（有特定标签），Node C 在“华北区”（淘汰！）。</li>
+</ul>
+</li>
+<li><strong>“打分” (Scoring - 排序)</strong>：从“海选”通过的 Node 中（比如剩下了 Node D 和 Node E），<code>Scheduler</code> 会给它们打分。比如，Node D 负载很低（得分高），Node E 负载很高（得分低）。</li>
+<li><strong>最终决定</strong>：<code>Scheduler</code> 选择得分最高的那个 Node（比如 Node D）。</li>
+<li><strong>更新订单</strong>：它<strong>不会</strong>自己去联系 Node D。它只会回到 <code>API Server</code>，更新那个 Pod 对象的 <code>spec.nodeName</code> 字段，把它从“空”改成 “Node D”。
+<strong>注意</strong>：<code>Scheduler</code> 只负责决策，不负责执行。它的结果只是修改了 etcd 里的记录，Pod 应该去 Node x</li>
+</ol>
+</li>
+</ul>
+<h2>Kubelet</h2>
+<ul>
+<li><strong>它是谁？</strong> 它是控制平面（Control Plane）安插在每个工作节点（Node）上的“代理人”。它也通过 informer 机制 watch <code>API Server</code></li>
+<li>
+<strong>它做什么？</strong><ol>
+<li><strong>发现新任务</strong>：在 <code>Scheduler</code> 调度完成之后。Node D 上的 <code>Kubelet</code> 发现 Pod spec. Nodename = Node D，</li>
+<li><strong>领任务</strong>：<code>Kubelet</code> 立刻从 <code>API Server</code> 那里拿到这个 Pod 的完整定义</li>
+<li>
+<strong>准备环境</strong>：它开始准备 Pod 运行所需的一切，比如：<ul>
+<li>创建数据卷（Volumes），这里可能会涉及 CSI 相关。</li>
+<li>如果需要特殊设备，需要device plugin，这点后面会讲到</li>
+<li>（如果是第一次）通知 <code>Container Runtime</code> 去拉取镜像， CRI 相关。</li>
+<li>配置网络，这里需要CNI 插件。</li>
+</ul>
+</li>
+<li><strong>下达执行命令</strong>：<code>Kubelet</code> 不会自己去启动容器，它会把这个工作交给 Container Runtime。
+<strong>注意</strong>：<code>Kubelet</code> 负责 1. 对 API-server 上报 Pod 状态，2. setup 环境，但具体运行容器并不是它的职责</li>
+</ol>
+</li>
+</ul>
+<h2>CSI（Container Storage Interface）</h2>
+<p>CSI 共有两个阶段，分别是 attach 和 Mount</p>
+<ul>
+<li><strong>Attach (附加) - 控制平面</strong>：如果 Pod 用的是“网络存储”（比如 AWS EBS, 谷歌云盘），一个<strong>在控制平面运行</strong>的 <code>csi-controller</code> (它也在 Watch API Server) 看到 Pod 被调度到 Node C，它会立刻发出一个 API 请求，把那块“云盘”（Attach）到 Node C 这个虚拟机上。<strong>这是 Kubelet 之外发生的</strong>。</li>
+<li>
+<strong>Mount (挂载) - Node 级别 (Kubelet 在此介入)</strong>：<ul>
+<li><code>Kubelet</code> 看到 Pod 的 <code>spec.volumes</code> 里定义了一个 <code>PersistentVolumeClaim</code> (PVC)。</li>
+<li>它<strong>首先</strong>会调用<strong>本机</strong>的 <code>CSI Node Plugin</code>（一个在 Node C 上的 <code>DaemonSet</code> Pod）：“嗨 CSI 插件，请把那个（刚 Attach 过来）的云盘，挂载到宿主机的一个特定目录，以便我稍后给 Pod 用。”</li>
+<li>CSI 插件负责格式化（如果是新的）、<code>mount</code> 这个设备到宿主机上的一个临时路径（比如 <code>/var/lib/kubelet/pods/.../volumes/my-pvc</code>）。</li>
+<li>CSI 插件完成后，告诉 <code>Kubelet</code>：“OK，地基打好了，路径是这个。”</li>
+</ul>
+</li>
+</ul>
+<h2>Container Runtime</h2>
+<ul>
+<li><strong>它是谁？</strong> 这就是真正在节点上跑容器的东西，比如 <strong>Docker</strong>、<strong>containerd</strong> 或 <strong>CRI-O</strong>。</li>
+<li>
+<strong>它做什么？</strong><ol>
+<li><code>Kubelet</code> 通过一个标准接口 (CRI - Container Runtime Interface) 对 <code>Container Runtime</code> 说：“启动这个容器，使用这个镜像，挂载这些卷”。</li>
+<li><code>Container Runtime</code> 负责拉取镜像（如果本地没有，如果本地有的话，会先走 cache）。</li>
+<li>它负责使用 Linux 内核功能（如 Cgroups 和 Namespaces）来创建和启动容器。</li>
+<li>容器<strong>真正跑起来了</strong>！</li>
+</ol>
+</li>
+<li><strong>状态上报</strong>：<code>Container Runtime</code> 把容器的状态（比如 &quot;Running&quot;）告诉 <code>Kubelet</code>。</li>
+<li><strong><code>Kubelet</code> 再上报</strong>：<code>Kubelet</code> 看到容器跑起来了，就高兴地跑去 <code>API Server</code> 那里更新 Pod 的状态（<code>status</code> 字段），改成 <strong>Running</strong>。</li>
+</ul>
+<h2>CRI&amp;CNI 运行时&amp;网络</h2>
+<ul>
+<li>
+<strong>Kubelet 调用 CRI</strong>：<code>Kubelet</code> 通过 CRI 接口对 <code>containerd</code> (或 Docker) 说：“启动这个 Pod Sandbox (沙箱)！”<ul>
+<li><strong>传递参数</strong>：它会把<strong>第 1 步</strong>（CSI）拿到的存储路径（<code>/var/lib/kubelet/pods/.../volumes/my-pvc</code>）和<strong>第 2 步</strong>（Device Plugin）拿到的设备路径（<code>/dev/nvidia0</code>）一起传给 <code>Container Runtime</code>。</li>
+<li><code>Container Runtime</code> 会把这些路径<strong>挂载 (bind mount)</strong> 到容器内部。</li>
+</ul>
+</li>
+<li>
+<strong>Container Runtime 调用 CNI (网络)</strong>：<br />
+<strong>容器运行时调整 CNI（网络）</strong> ：<ul>
+<li><code>Container Runtime</code> 创建了容器的进程和命名空间（PID, Mount, ...），<strong>但此时容器还没有 IP 地址</strong>，它还在一个“网络隔离”的状态。</li>
+<li>此时，<code>Container Runtime</code>（根据 <code>Kubelet</code> 的配置）会调用<strong>本机</strong>上的 <strong>CNI 插件</strong>（比如 Calico, Flannel，它们通常也是 <code>DaemonSet</code>）。</li>
+<li><code>CNI</code> 插件执行以下操作： a. 从 CNI 的“IP 地址管理器”(IPAM) 那里申请一个 IP (比如 <code>10.244.2.5</code>)。 b. 在宿主机（Node C）上创建一个“虚拟网线对”(veth pair)。 c. 一端留在宿主机上（插到“交换机” - Linux Bridge 上），另一端插到容器的“网络命名空间”里，并配置上 <code>10.244.2.5</code> 这个 IP 地址和路由规则。</li>
+<li><code>CNI</code> 插件完成后，把分配的 IP 地址（<code>10.244.2.5</code>）返回给 <code>Container Runtime</code>。</li>
+</ul>
+</li>
+<li>
+<strong>启动！</strong><ul>
+<li><code>Container Runtime</code> 看到网络也 OK 了，最后才启动容器的主进程（<code>CMD</code> / <code>ENTRYPOINT</code>）。</li>
+</ul>
+</li>
+</ul>
+<h1>外挂系统</h1>
+<h2>Device Plugin</h2>
+<p>此刻，Pod 已经被调度上了正确的 Node 上，并且 kubelet 已经准备好启动它了，但是 Pod 订单上有一个特殊要求：</p>
+<pre><code class="language-YAML">spec: 
+  containers: 
+  - name: cuda-container 
+    image: nvidia/cuda:11.0-base 
+    resources: 
+      limits: 
+        nvidia.com/gpu: 1
+</code></pre>
+<p>kubelet 自己并不知道 <code>nvidia.com/gpu</code> 是什么，它只认识 cpu、memory，所以这里需要解决两个问题：</p>
+<ol>
+<li>scheduler需要知道Node 上有几块GPU </li>
+<li>怎么Node 上的一块 GPU 分配给 Pod</li>
+</ol>
+<p>这时候就需要 <code>Device Plugin</code> 的机制发挥作用了，它允许第三方厂商（比如 NVIDIA、Intel、Mellanox 等）来告诉 <code>Kubelet</code> 如何管理他们的特定硬件</p>
+<p>具体的作用机制是：</p>
+<ul>
+<li>
+<strong>1. 注册 (Registration)</strong><ol>
+<li>首先，集群管理员会在<strong>每一个</strong>需要特殊硬件的 Node 上（比如 Node C），以 <code>DaemonSet</code> 的形式部署一个 <strong>Device Plugin Pod</strong>（例如 <code>nvidia-device-plugin-ds</code>）。</li>
+<li>这个 <code>nvidia-device-plugin</code> Pod 启动后，它会去<strong>侦测</strong>宿主机（Node C）上有多少块 NVIDIA GPU。假设它发现了 2 块 GPU（<code>/dev/nvidia0</code>, <code>/dev/nvidia1</code>）。</li>
+<li>它通过一个 <code>gRPC</code> 接口（在 Node 本地，通常是一个 Unix socket 文件）主动<strong>联系</strong>本机的 <code>Kubelet</code>：“你好 <code>Kubelet</code>，我是 <code>nvidia.com/gpu</code> 插件，我在这里发现了 2 块 GPU 资源。”</li>
+</ol>
+</li>
+<li>
+<strong>2. Kubelet 向 API Server上报库存 (Advertising)</strong><ol>
+<li><code>Kubelet</code> 收到这个注册信息后，它立刻向 <code>API Server</code> <strong>上报自己的状态 (Node Status)</strong>。</li>
+<li>它会在自己的 Node 对象里，更新一个叫做 <code>allocatable</code> (可分配资源) 的字段，在 <code>cpu</code> 和 <code>memory</code> 旁边，加上一行：<code>allocatable: { ... , nvidia.com/gpu: 2 }</code>。</li>
+<li>现在，<code>API Server</code> 和 <code>etcd</code> 就知道了：“Node C 有 2 块 GPU 库存”。</li>
+</ol>
+</li>
+<li>
+<strong>3. 调度 (Scheduling)</strong><ol>
+<li>现在回到我们的第二站！当 <code>Scheduler</code> 看到那个要求 <code>nvidia.com/gpu: 1</code> 的 Pod 时，它会去查看所有 Node 的 <code>allocatable</code> 库存。</li>
+<li>它会发现 Node C 有 <code>nvidia.com/gpu: 2</code>（库存 &gt; 1），所以（在 Filtering 阶段）Node C 是一个合格的节点。</li>
+<li><code>Scheduler</code> 于是把 Pod 分配给了 Node C。</li>
+</ol>
+</li>
+<li>
+<strong>4. 分配 (Allocation)</strong><ol>
+<li><code>Kubelet</code>（在 Node C 上）拿到了这个 Pod。它看到了 <code>nvidia.com/gpu: 1</code> 的请求。</li>
+<li><code>Kubelet</code> <strong>不会自己</strong>去挑 GPU。它会再次通过 <code>gRPC</code> 联系 <code>nvidia-device-plugin</code> 分配具体的 GPU</li>
+<li><code>nvidia-device-plugin</code> 负责管理 GPU 的“分配账本”。它说：“好的，我把 <code>/dev/nvidia0</code> 分配给 Pod A。” 然后它把这个设备路径（以及可能需要的环境变量或挂载）回复给 <code>Kubelet</code>。</li>
+<li><code>Kubelet</code> 拿到了这个具体信息（比如“把 <code>/dev/nvidia0</code> 挂载进容器”）。</li>
+</ol>
+</li>
+<li>
+<strong>5. 启动 (Container Runtime)</strong><ol>
+<li><code>Kubelet</code> 最后去调用 <code>Container Runtime</code> (比如 <code>containerd</code>)。</li>
+<li>启动这个 <code>nvidia/cuda:11.0-base</code> 镜像，并且，把宿主机的 <code>/dev/nvidia0</code> 设备<strong>注入 (mount)</strong> 到这个新容器的内部。</li>
+<li><code>Container Runtime</code> 照做。<br />
+<strong>最终</strong></li>
+</ol>
+</li>
+<li><strong>向 Kubelet 注册 (Register)</strong>：告诉 <code>Kubelet</code> “我管理这种硬件”。</li>
+<li><strong>帮助 Kubelet 上报 (Advertise)</strong>：让 <code>Kubelet</code> 告诉 <code>Scheduler</code> “我有多少这种硬件”。</li>
+<li><strong>替 Kubelet 分配 (Allocate)</strong>：当 Pod 被调度过来后，告诉 <code>Kubelet</code> “请把_这块_具体的硬件给它”。</li>
+</ul>
+<p>device plugin 这一设计，</p>
+<ol>
+<li>扩展性极强，让 K8s 可以“即插即用”地支持任何未来的新硬件</li>
+<li>插件管理分配，让插件开发者可以自由的虚拟化设备</li>
+<li>上报的功能，要求插件开发者需要管理健康检查</li>
+</ol>
+<h1>其他组件</h1>
+<h2>Kube-proxy</h2>
+<ul>
+<li><strong>他是谁？</strong> <code>kube-proxy</code> 负责的网络，特别是 <code>Service</code> 的实现</li>
+<li><strong>职责</strong>：<code>kube-proxy</code> 的工作是确保 K8s 的 <code>Service</code> 能够正常的工作</li>
+<li>
+它做什么？<ol>
+<li>Watch API server，但它关心的是 <code>Service</code> 和 <code>Endpoints</code></li>
+<li>当一个新的 <code>Service</code> 被创建，或者一个 Pod 变得 &quot;Running&quot; 并且 &quot;Ready&quot;（<code>Kubelet</code> 会上报这个状态），这个 Pod 的 IP 就会被添加到 <code>Endpoints</code> 列表里。</li>
+<li><code>kube-proxy</code> 看到这个变化后，就会在<strong>它所在的 Node</strong> 上修改网络规则（比如 <code>iptables</code> 或 <code>ipvs</code>）。</li>
+<li>这些规则的作用是：“如果有人想访问 <code>Service</code> 的虚拟 IP（比如 <code>10.96.0.10</code>），我就把这个请求（做-网络地址转换-NAT）转发到它后面某个真实 Pod 的 IP（比如 <code>192.168.1.5</code>）上。”</li>
+</ol>
+</li>
+</ul>
+<h1>一图胜千言</h1>
+<img width="1468" height="776" alt="Image" src="https://github.com/user-attachments/assets/8e899a69-5732-4d2e-a9e0-f8cba0c3490b" />
+<blockquote>
+<p>题后记：我个人不太喜欢这种“概念化”的面试风格，原因是这些流程式的概念知道就是知道，不知道的话很难在面试的时间内通过某些线索去推敲出结论来，属于很难考察出来候选人思维的题目。但是，anyway，弄清楚这一问题确实帮助我理清了这里面的架构关系，仅此写一篇 blog 作为记录</p>
+</blockquote>
+]]></content><link href="https://github.com/ZHOUSH41/gitblog/issues/3"/><category term="K8s"/><category term="interview"/><published>2025-10-25T05:35:28+00:00</published></entry><entry><id>https://github.com/ZHOUSH41/gitblog/issues/2</id><title>About Me</title><updated>2025-10-25T05:35:58.187689+00:00</updated><content type="html"><![CDATA[<p>关于我的自我介绍</p>
+]]></content><link href="https://github.com/ZHOUSH41/gitblog/issues/2"/><category term="About"/><published>2025-10-22T08:47:22+00:00</published></entry><entry><id>https://github.com/ZHOUSH41/gitblog/issues/1</id><title>init blog</title><updated>2025-10-25T05:35:58.322781+00:00</updated><content type="html"><![CDATA[<p>Test blog readme generate</p>
 ]]></content><link href="https://github.com/ZHOUSH41/gitblog/issues/1"/><category term="TODO"/><published>2025-10-22T07:17:18+00:00</published></entry></feed>
